@@ -242,36 +242,21 @@ def analyze_pair(pair: str, candles: list, min_score: int) -> dict | None:
 # ── Форматирование сигнала (компактно) ────────────────────────────────────────
 def format_signal(sig: dict, expiry: int) -> str:
     now   = datetime.now(MSK).strftime("%H:%M МСК")
-    if sig["direction"] == "CALL":
-        direction_line = "🟢 *CALL ▲*"
-    else:
-        direction_line = "🔴 *PUT ▼*"
-
-    level_line = "\n🔔 *У УРОВНЯ S/R*" if sig.get("at_level") else ""
+    arrow = "🟢 CALL ▲" if sig["direction"] == "CALL" else "🔴 PUT ▼"
     return (
-        f"📡 *{sig['pair']}*{level_line}\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"{direction_line}\n"
-        f"⏱ *{expiry} мин* | {get_interval(expiry)} свечи\n"
-        f"{sig['stars']} *{sig['score']}%*\n"
-        f"💰 `{sig['price']:.5f}`\n"
-        f"🕐 {now}"
+        f"*{sig['pair']}* | {arrow}\n"
+        f"⏱ Экспирация: *{expiry} мин*\n"
+        f"{sig['stars']} Оценка: *{sig['score']}%*\n"
+        f"💰 `{sig['price']:.5f}` | {now}"
     )
 
 # ── Форматирование результата ─────────────────────────────────────────────────
 def format_result(rec: dict, current_price: float, won: bool) -> str:
-    diff   = current_price - rec["price"]
-    diff_p = diff / rec["price"] * 100
-    icon   = "✅" if won else "❌"
-    word   = "ЗАШЁЛ" if won else "НЕ ЗАШЁЛ"
-    arrow  = "▲" if rec["direction"] == "CALL" else "▼"
+    diff_p = (current_price - rec["price"]) / rec["price"] * 100
+    icon   = "✅ ЗАШЁЛ" if won else "❌ НЕ ЗАШЁЛ"
     return (
-        f"{icon} *{word}*\n"
-        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"*{rec['pair']}* {arrow} {rec['direction']}\n"
-        f"Вход:    `{rec['price']:.5f}`\n"
-        f"Сейчас:  `{current_price:.5f}`\n"
-        f"Δ {diff_p:+.3f}%"
+        f"{icon} | *{rec['pair']}*\n"
+        f"Вход: `{rec['price']:.5f}` → `{current_price:.5f}` ({diff_p:+.3f}%)"
     )
 
 # ── Проверка результатов ──────────────────────────────────────────────────────
@@ -309,7 +294,8 @@ async def check_pending_results(bot, chat_id: int, pair: str, current_price: flo
             result_text = format_result(rec, current_price, won)
             await bot.send_message(
                 chat_id=chat_id,
-                text=f"{result_text}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n📊 Счёт: ✅{st['win']} ❌{st['loss']} | {winrate}%",
+                text=f"{result_text}\n📊 ✅{st['win']} ❌{st['loss']} | {winrate}%",
+                reply_to_message_id=rec.get("message_id"),
                 parse_mode="Markdown"
             )
 
@@ -334,17 +320,18 @@ async def do_scan(msg, settings: dict, chat_id: int = None, bot=None, silent_if_
         sig = analyze_pair(pair, candles, settings["min_score"])
         if sig:
             found += 1
-            await msg.reply_text(format_signal(sig, settings["expiry"]), parse_mode="Markdown")
+            sent = await msg.reply_text(format_signal(sig, settings["expiry"]), parse_mode="Markdown")
             if chat_id:
                 if chat_id not in signal_history:
                     signal_history[chat_id] = []
                 signal_history[chat_id].append({
-                    "pair":      pair,
-                    "direction": sig["direction"],
-                    "price":     sig["price"],
-                    "expiry":    settings["expiry"],
-                    "time":      datetime.now(MSK),
-                    "done":      False,
+                    "pair":       pair,
+                    "direction":  sig["direction"],
+                    "price":      sig["price"],
+                    "expiry":     settings["expiry"],
+                    "time":       datetime.now(MSK),
+                    "done":       False,
+                    "message_id": sent.message_id if sent else None,
                 })
                 signal_history[chat_id] = signal_history[chat_id][-30:]
 
@@ -374,7 +361,7 @@ async def auto_scan(ctx: ContextTypes.DEFAULT_TYPE):
     # Отправляем в чат через bot
     class FakeMsg:
         async def reply_text(self, text, **kwargs):
-            await ctx.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            return await ctx.bot.send_message(chat_id=chat_id, text=text, **kwargs)
 
     await do_scan(FakeMsg(), settings, chat_id=chat_id, bot=ctx.bot)
 
