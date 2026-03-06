@@ -409,6 +409,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     wr      = int(st["win"]/total*100) if total > 0 else 0
     open_s  = len([r for r in signal_history.get(chat_id, []) if not r.get("done")])
 
+    kb = [[InlineKeyboardButton("🔄 Сбросить счёт", callback_data="reset_stats")]]
     await (update.message or update.callback_query.message).reply_text(
         f"📊 *Статус*\n\n"
         f"🖥 Сервер: *✅ Работает*\n"
@@ -423,6 +424,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📋 Открытых сигналов: *{open_s}*\n"
         f"🏆 Счёт: ✅{st['win']} ❌{st['loss']} | *{wr}%*",
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb),
     )
 
 async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -524,7 +526,10 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s       = get_settings(chat_id)
     data    = q.data
 
-    if   data == "subscribe":      await cmd_subscribe(update, ctx)
+    if   data == "reset_stats":
+        stats[chat_id] = {"win": 0, "loss": 0}
+        await q.message.reply_text("🔄 Счёт сброшен: ✅0 ❌0")
+    elif data == "subscribe":      await cmd_subscribe(update, ctx)
     elif data == "unsubscribe":    await cmd_unsubscribe(update, ctx)
     elif data == "settings_menu":  await cmd_settings(update, ctx)
     elif data == "help":           await cmd_help(update, ctx)
