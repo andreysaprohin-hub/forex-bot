@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Forex Signal Bot — v2"""
+"""Forex Signal Bot — v3"""
 
 import asyncio
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
+from math import floor
 
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes,
 )
 
 BOT_TOKEN       = "8612612451:AAE7dMyGwf1Ddigz23Ygeop5ubh1nkrm6M8"
@@ -61,6 +63,10 @@ DEFAULT_SETTINGS = {
 
 user_settings: dict = {}
 
+# Хранение сигналов для отслеживания результата
+# {chat_id: [{pair, direction, price, expiry, time, done}]}
+signal_history: dict = {}
+
 def get_settings(chat_id: int) -> dict:
     if chat_id not in user_settings:
         user_settings[chat_id] = DEFAULT_SETTINGS.copy()
@@ -72,17 +78,34 @@ def is_allowed(update: Update) -> bool:
 
 def is_trading_time(settings: dict) -> bool:
     now = datetime.now(MSK)
-    if now.weekday() >= 5:   # сб=5, вс=6
+    if now.weekday() >= 5:
         return False
     return settings["hour_from"] <= now.hour < settings["hour_to"]
 
 def get_interval(expiry: int) -> str:
-    half = expiry // 2
-    if half <= 1:  return "1min"
-    if half <= 5:  return "5min"
-    if half <= 15: return "15min"
-    if half <= 30: return "30min"
+    """Таймфрейм всегда меньше экспирации"""
+    if expiry <= 5:   return "1min"
+    if expiry <= 10:  return "3min"
+    if expiry <= 15:  return "5min"
+    if expiry <= 30:  return "15min"
+    if expiry <= 60:  return "30min"
     return "1h"
+
+def minutes_to_next_period(scan_every: int) -> int:
+    """Сколько минут до следующего кратного периода (10:00, 10:15, 10:30...)"""
+    now     = datetime.now(MSK)
+    minutes = now.hour * 60 + now.minute
+    elapsed = minutes % scan_every
+    remaining = scan_every - elapsed
+    return remaining
+
+def should_scan_now(scan_every: int) -> bool:
+    """Сканировать сейчас если прошло < 10% периода"""
+    now     = datetime.now(MSK)
+    minutes = now.hour * 60 + now.minute
+    elapsed = minutes % scan_every
+    threshold = max(1, scan_every // 10)
+    return elapsed <= threshold
 
 # ── Данные ────────────────────────────────────────────────────────────────────
 def fetch_forex_data(from_sym: str, to_sym: str, expiry: int) -> list | None:
@@ -151,29 +174,19 @@ def stochastic(candles: list, period: int = 14) -> float:
     cl = candles[-1]["close"]
     return 50.0 if hi == lo else (cl-lo)/(hi-lo)*100
 
-# ── Уровни поддержки/сопротивления (swing high/low) ──────────────────────────
-def find_levels(candles: list, lookback: int = 20) -> tuple[list, list]:
-    """Находит swing high и swing low за последние lookback свечей"""
-    if len(candles) < lookback + 2:
-        return [], []
-    window   = candles[-(lookback+2):-1]
-    supports    = []
-    resistances = []
+def find_levels(candles: list, lookback: int = 20) -> tuple:
+    if len(candles) < lookback + 2: return [], []
+    window = candles[-(lookback+2):-1]
+    supports, resistances = [], []
     for i in range(1, len(window)-1):
-        # Swing low — локальный минимум
         if window[i]["low"] < window[i-1]["low"] and window[i]["low"] < window[i+1]["low"]:
             supports.append(window[i]["low"])
-        # Swing high — локальный максимум
         if window[i]["high"] > window[i-1]["high"] and window[i]["high"] > window[i+1]["high"]:
             resistances.append(window[i]["high"])
     return supports, resistances
 
 def near_level(price: float, levels: list, threshold_pct: float = 0.001) -> bool:
-    """Проверяет близость цены к уровню (порог 0.1%)"""
-    for lvl in levels:
-        if abs(price - lvl) / lvl < threshold_pct:
-            return True
-    return False
+    return any(abs(price - lvl) / lvl < threshold_pct for lvl in levels)
 
 # ── Анализ пары ───────────────────────────────────────────────────────────────
 def analyze_pair(pair: str, candles: list, min_score: int) -> dict | None:
@@ -183,21 +196,18 @@ def analyze_pair(pair: str, candles: list, min_score: int) -> dict | None:
     vc, vp, details = 0, 0, []
 
     # EMA 9/33
-    e9  = ema(closes, 9)
-    e33 = ema(closes, 33)
+    e9, e33 = ema(closes, 9), ema(closes, 33)
     if   e9[-1] > e33[-1] and e9[-2] <= e33[-2]: vc += 25; details.append("📈 EMA 9/33 кросс вверх")
     elif e9[-1] < e33[-1] and e9[-2] >= e33[-2]: vp += 25; details.append("📉 EMA 9/33 кросс вниз")
     elif e9[-1] > e33[-1]:                        vc += 10; details.append("📈 EMA 9/33 тренд вверх")
     else:                                          vp += 10; details.append("📉 EMA 9/33 тренд вниз")
 
-    # Уровни поддержки/сопротивления
+    # Уровни S/R
     supports, resistances = find_levels(candles)
     at_support    = near_level(price, supports)
     at_resistance = near_level(price, resistances)
-    if at_support:
-        vc += 20; details.append(f"🟩 Цена у уровня поддержки ({price:.5f})")
-    if at_resistance:
-        vp += 20; details.append(f"🟥 Цена у уровня сопротивления ({price:.5f})")
+    if at_support:    vc += 20; details.append(f"🟩 У уровня поддержки")
+    if at_resistance: vp += 20; details.append(f"🟥 У уровня сопротивления")
 
     # RSI
     rv = rsi(closes)
@@ -216,8 +226,8 @@ def analyze_pair(pair: str, candles: list, min_score: int) -> dict | None:
 
     # Bollinger
     upper, _, lower = bollinger(closes)
-    if   price <= lower: vc += 15; details.append("🎯 Цена у нижней полосы Боллинджера")
-    elif price >= upper: vp += 15; details.append("🎯 Цена у верхней полосы Боллинджера")
+    if   price <= lower: vc += 15; details.append("🎯 У нижней полосы Боллинджера")
+    elif price >= upper: vp += 15; details.append("🎯 У верхней полосы Боллинджера")
 
     # Stochastic
     st = stochastic(candles)
@@ -226,58 +236,113 @@ def analyze_pair(pair: str, candles: list, min_score: int) -> dict | None:
 
     total = vc + vp
     if total == 0: return None
-    if vc > vp:
-        direction = "CALL"; score = int(vc/total*100)
-    else:
-        direction = "PUT";  score = int(vp/total*100)
+    direction = "CALL" if vc > vp else "PUT"
+    score = int(max(vc, vp)/total*100)
     if score < min_score: return None
 
     stars = "⭐⭐⭐⭐⭐" if score >= 90 else "⭐⭐⭐⭐" if score >= 80 else "⭐⭐⭐"
-    return {"pair": pair, "direction": direction, "score": score,
-            "stars": stars, "details": details, "price": price,
-            "at_level": at_support or at_resistance}
+    return {
+        "pair": pair, "direction": direction, "score": score,
+        "stars": stars, "details": details, "price": price,
+        "at_level": at_support or at_resistance,
+    }
 
-# ── Форматирование ────────────────────────────────────────────────────────────
+# ── Проверка результата прошлого сигнала ──────────────────────────────────────
+def check_signal_result(sig_record: dict, current_price: float) -> str | None:
+    """Проверяет зашёл ли прошлый сигнал"""
+    if sig_record.get("done"):
+        return None
+    entry    = sig_record["price"]
+    direction= sig_record["direction"]
+    pair     = sig_record["pair"]
+    diff_pct = (current_price - entry) / entry * 100
+
+    if direction == "CALL":
+        result = "✅ ЗАШЁЛ" if diff_pct > 0.01 else ("❌ НЕ ЗАШЁЛ" if diff_pct < -0.01 else None)
+    else:
+        result = "✅ ЗАШЁЛ" if diff_pct < -0.01 else ("❌ НЕ ЗАШЁЛ" if diff_pct > 0.01 else None)
+
+    if result:
+        sig_record["done"] = True
+        return f"{result} | {pair} {direction} | вход {entry:.5f} → сейчас {current_price:.5f}"
+    return None
+
+# ── Форматирование сигнала ────────────────────────────────────────────────────
 def format_signal(sig: dict, expiry: int) -> str:
     now   = datetime.now(MSK).strftime("%H:%M МСК")
     arrow = "🟢 CALL ▲" if sig["direction"] == "CALL" else "🔴 PUT  ▼"
     dtext = "\n".join(f"  • {d}" for d in sig["details"])
-    level_tag = "\n🎯 *СИГНАЛ У УРОВНЯ*" if sig.get("at_level") else ""
+    level_tag = "\n🔔 *СИГНАЛ У УРОВНЯ*" if sig.get("at_level") else ""
     return (
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📡 *СИГНАЛ* | {now}{level_tag}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 Пара:          *{sig['pair']}*\n"
-        f"📌 Направление:  *{arrow}*\n"
-        f"⏱ Экспирация:   *{expiry} минут*\n"
-        f"📊 Уверенность:  {sig['stars']} *{sig['score']}%*\n"
-        f"💰 Цена входа:   `{sig['price']:.5f}`\n"
+        f"💱 Пара:         *{sig['pair']}*\n"
+        f"📌 Направление: *{arrow}*\n"
+        f"⏱ Экспирация:  *{expiry} мин* | TF: {get_interval(expiry)}\n"
+        f"📊 Уверенность: {sig['stars']} *{sig['score']}%*\n"
+        f"💰 Цена входа:  `{sig['price']:.5f}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"*Основания:*\n{dtext}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⚠️ _Не финансовый совет._"
     )
 
+# ── Постоянное меню снизу ─────────────────────────────────────────────────────
+MAIN_KEYBOARD = ReplyKeyboardMarkup([
+    ["📡 Разовая проверка", "⚙️ Настройки"],
+    ["▶️ Подписаться",      "⏹ Отписаться"],
+    ["📊 Статус",           "❓ Помощь"],
+], resize_keyboard=True, persistent=True)
+
 # ── Сканирование ──────────────────────────────────────────────────────────────
-async def do_scan(msg, settings: dict, silent_if_empty: bool = False):
+async def do_scan(msg, settings: dict, chat_id: int = None, silent_if_empty: bool = False):
     found = 0
+    results_to_check = signal_history.get(chat_id, []) if chat_id else []
+
     for pair in settings["active_pairs"]:
         if requests_left() == 0:
-            await msg.reply_text("⚠️ Лимит запросов на сегодня исчерпан (800/день). Продолжу завтра.")
+            await msg.reply_text("⚠️ Лимит запросов (800/день) исчерпан. Продолжу завтра.")
             break
         fs, ts  = pair.split("/")
         candles = fetch_forex_data(fs, ts, settings["expiry"])
         if not candles:
             await asyncio.sleep(8); continue
+
+        current_price = candles[-1]["close"]
+
+        # Проверяем результат прошлого сигнала по этой паре
+        if chat_id:
+            for rec in results_to_check:
+                if rec["pair"] == pair and not rec.get("done"):
+                    result_text = check_signal_result(rec, current_price)
+                    if result_text:
+                        await msg.reply_text(f"📋 *Результат:* {result_text}", parse_mode="Markdown")
+
         sig = analyze_pair(pair, candles, settings["min_score"])
         if sig:
             found += 1
             await msg.reply_text(format_signal(sig, settings["expiry"]), parse_mode="Markdown")
+            # Запоминаем сигнал для отслеживания
+            if chat_id:
+                if chat_id not in signal_history:
+                    signal_history[chat_id] = []
+                signal_history[chat_id].append({
+                    "pair": pair,
+                    "direction": sig["direction"],
+                    "price": sig["price"],
+                    "expiry": settings["expiry"],
+                    "time": datetime.now(MSK),
+                    "done": False,
+                })
+                # Держим только последние 20 сигналов
+                signal_history[chat_id] = signal_history[chat_id][-20:]
+
         await asyncio.sleep(8)
+
     if found == 0 and not silent_if_empty:
         await msg.reply_text(
-            f"🔕 Сигналов нет.\n"
-            f"Осталось запросов сегодня: *{requests_left()}*",
+            f"🔕 Сигналов нет.\n💾 Запросов осталось: *{requests_left()}*",
             parse_mode="Markdown"
         )
     return found
@@ -293,12 +358,28 @@ async def auto_scan(ctx: ContextTypes.DEFAULT_TYPE):
         return
     log.info(f"Авто-скан для {chat_id}")
     found = 0
+    results_to_check = signal_history.get(chat_id, [])
+
     for pair in settings["active_pairs"]:
         if requests_left() == 0: break
         fs, ts  = pair.split("/")
         candles = fetch_forex_data(fs, ts, settings["expiry"])
         if not candles:
             await asyncio.sleep(8); continue
+
+        current_price = candles[-1]["close"]
+
+        # Результат прошлого сигнала
+        for rec in results_to_check:
+            if rec["pair"] == pair and not rec.get("done"):
+                result_text = check_signal_result(rec, current_price)
+                if result_text:
+                    await ctx.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"📋 *Результат:* {result_text}",
+                        parse_mode="Markdown"
+                    )
+
         sig = analyze_pair(pair, candles, settings["min_score"])
         if sig:
             found += 1
@@ -307,58 +388,102 @@ async def auto_scan(ctx: ContextTypes.DEFAULT_TYPE):
                 text=format_signal(sig, settings["expiry"]),
                 parse_mode="Markdown"
             )
+            if chat_id not in signal_history:
+                signal_history[chat_id] = []
+            signal_history[chat_id].append({
+                "pair": pair, "direction": sig["direction"],
+                "price": sig["price"], "expiry": settings["expiry"],
+                "time": datetime.now(MSK), "done": False,
+            })
+            signal_history[chat_id] = signal_history[chat_id][-20:]
+
         await asyncio.sleep(8)
-    log.info(f"Авто-скан {chat_id}: {found} сигналов, осталось запросов: {requests_left()}")
+
+    log.info(f"Авто-скан {chat_id}: {found} сигналов, запросов: {requests_left()}")
 
 # ── Команды ───────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("⛔ Доступ запрещён."); return
-    s = get_settings(update.effective_chat.id)
+    s   = get_settings(update.effective_chat.id)
     now = datetime.now(MSK)
-    weekend = "⛔ Выходной" if now.weekday() >= 5 else "✅ Рабочий день"
+    weekend  = "⛔ Выходной" if now.weekday() >= 5 else "✅ Рабочий день"
     in_hours = "✅ В торговых часах" if is_trading_time(s) else "💤 Вне торговых часов"
-    kb = [
-        [InlineKeyboardButton("📡 Разовая проверка", callback_data="quick_scan_menu")],
-        [InlineKeyboardButton("▶️ Подписаться", callback_data="subscribe"),
-         InlineKeyboardButton("⏹ Отписаться", callback_data="unsubscribe")],
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings_menu")],
-        [InlineKeyboardButton("📊 Запросы: " + str(requests_left()) + "/800", callback_data="show_requests")],
-    ]
     await update.message.reply_text(
-        f"🤖 *Forex Signal Bot v2*\n\n"
+        f"🤖 *Forex Signal Bot v3*\n\n"
         f"{weekend} | {in_hours}\n"
         f"⏱ Экспирация: *{s['expiry']} мин* | TF: *{get_interval(s['expiry'])}*\n"
         f"🔄 Скан каждые: *{s['scan_every']} мин*\n"
         f"🕐 Часы: *{s['hour_from']}:00–{s['hour_to']}:00 МСК*\n"
         f"🎯 Мин. скор: *{s['min_score']}%*\n"
-        f"📊 Пар: *{len(s['active_pairs'])}* | Запросов: *{requests_left()}/800*",
+        f"📊 Пар: *{len(s['active_pairs'])}* | 💾 Запросов: *{requests_left()}/800*\n\n"
+        f"Меню доступно внизу 👇",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb),
+        reply_markup=MAIN_KEYBOARD,
     )
 
-async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
-    msg = update.message or update.callback_query.message
-    s   = get_settings(update.effective_chat.id)
-    await msg.reply_text(f"🔍 Сканирую {len(s['active_pairs'])} пар... (TF: {get_interval(s['expiry'])})\n💾 Запросов осталось: {requests_left()}")
-    await do_scan(msg, s)
+    chat_id  = update.effective_chat.id
+    s        = get_settings(chat_id)
+    now      = datetime.now(MSK)
+    jobs     = ctx.job_queue.get_jobs_by_name(str(chat_id))
+    subscribed = "✅ Активна" if jobs else "❌ Не активна"
+    weekend  = "⛔ Выходной" if now.weekday() >= 5 else "✅ Рабочий день"
+    in_hours = "✅ Торговые часы" if is_trading_time(s) else "💤 Вне торговых часов"
+    next_scan = minutes_to_next_period(s["scan_every"])
+
+    # Незакрытые сигналы
+    open_sigs = [r for r in signal_history.get(chat_id, []) if not r.get("done")]
+
+    await update.message.reply_text(
+        f"📊 *Статус бота*\n\n"
+        f"🖥 Сервер: *✅ Работает*\n"
+        f"📡 Подписка: *{subscribed}*\n"
+        f"📅 {weekend} | {in_hours}\n"
+        f"⏰ До следующего скана: *~{next_scan} мин*\n\n"
+        f"⚙️ *Настройки:*\n"
+        f"⏱ Экспирация: *{s['expiry']} мин* | TF: *{get_interval(s['expiry'])}*\n"
+        f"🔄 Каждые: *{s['scan_every']} мин*\n"
+        f"🕐 *{s['hour_from']}:00–{s['hour_to']}:00 МСК*\n"
+        f"🎯 Скор: *{s['min_score']}%*\n"
+        f"📊 Пар: *{len(s['active_pairs'])}*\n\n"
+        f"💾 *Запросы:* {requests_left()}/800 осталось\n"
+        f"📋 *Открытых сигналов:* {len(open_sigs)}",
+        parse_mode="Markdown",
+    )
 
 async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     msg     = update.message or update.callback_query.message
     chat_id = update.effective_chat.id
     s       = get_settings(chat_id)
+
     for job in ctx.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
-    ctx.job_queue.run_repeating(auto_scan, interval=s["scan_every"]*60,
-                                first=10, chat_id=chat_id, name=str(chat_id))
+
+    # Умный первый запуск
+    if should_scan_now(s["scan_every"]):
+        first_in = 5  # почти сразу
+        first_msg = "Первое сканирование через ~5 сек"
+    else:
+        first_in = minutes_to_next_period(s["scan_every"]) * 60
+        first_msg = f"Первое сканирование через ~{minutes_to_next_period(s['scan_every'])} мин (в начале следующего периода)"
+
+    ctx.job_queue.run_repeating(
+        auto_scan,
+        interval=s["scan_every"]*60,
+        first=first_in,
+        chat_id=chat_id,
+        name=str(chat_id)
+    )
     await msg.reply_text(
         f"✅ *Подписка активирована!*\n\n"
         f"🔄 Каждые *{s['scan_every']} мин*\n"
         f"🕐 *{s['hour_from']}:00–{s['hour_to']}:00 МСК*, без выходных\n"
         f"⏱ Экспирация *{s['expiry']} мин* | TF: *{get_interval(s['expiry'])}*\n"
-        f"📊 Пар: *{len(s['active_pairs'])}*",
+        f"📊 Пар: *{len(s['active_pairs'])}*\n\n"
+        f"⏰ {first_msg}",
         parse_mode="Markdown",
     )
 
@@ -388,25 +513,24 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🕐 Часы: *{s['hour_from']}:00–{s['hour_to']}:00 МСК*\n"
         f"🎯 Мин. скор: *{s['min_score']}%*\n"
         f"📊 Активных пар: *{len(s['active_pairs'])}* из {len(ALL_PAIRS)}\n"
-        f"💾 Запросов сегодня: *{requests_left()}/800*",
+        f"💾 Запросов: *{requests_left()}/800*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
-    msg = update.message or update.callback_query.message
-    await msg.reply_text(
-        "📖 *Forex Signal Bot v2*\n\n"
+    await (update.message or update.callback_query.message).reply_text(
+        "📖 *Forex Signal Bot v3*\n\n"
         "*Индикаторы:*\n"
-        "• EMA 9/33 — тренд и кросс\n"
-        "• Уровни S/R — swing high/low\n"
+        "• EMA 9/33 — тренд и пересечение\n"
+        "• S/R уровни — swing high/low\n"
         "• RSI 14\n• MACD\n• Bollinger Bands\n• Stochastic\n\n"
-        "*Таймфрейм* подбирается автоматически:\n"
-        "экспирация 15м → свечи 5м\n"
-        "экспирация 30м → свечи 15м\n\n"
+        "*Таймфрейм по экспирации:*\n"
+        "5м→1м | 10м→3м | 15м→5м | 30м→15м | 60м→30м\n\n"
+        "*Результаты:* бот автоматически проверяет зашёл ли прошлый сигнал при следующем сканировании\n\n"
         "*/start* — главное меню\n"
-        "*/scan* — разовое сканирование\n"
+        "*/status* — статус сервера и бота\n"
         "*/subscribe* — автосигналы\n"
         "*/unsubscribe* — отключить\n"
         "*/settings* — настройки\n\n"
@@ -414,7 +538,30 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-# ── Кнопки ────────────────────────────────────────────────────────────────────
+# ── Обработчик текстовых кнопок меню ─────────────────────────────────────────
+async def menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update): return
+    text = update.message.text
+    if text == "📊 Статус":
+        await cmd_status(update, ctx)
+    elif text == "⚙️ Настройки":
+        await cmd_settings(update, ctx)
+    elif text == "▶️ Подписаться":
+        await cmd_subscribe(update, ctx)
+    elif text == "⏹ Отписаться":
+        await cmd_unsubscribe(update, ctx)
+    elif text == "❓ Помощь":
+        await cmd_help(update, ctx)
+    elif text == "📡 Разовая проверка":
+        kb = [[InlineKeyboardButton(f"{v} мин", callback_data=f"quick_{v}") for v in [5,10,15,30]],
+              [InlineKeyboardButton(f"{v} мин", callback_data=f"quick_{v}") for v in [45,60]]]
+        await update.message.reply_text(
+            "📡 *Разовая проверка*\nВыбери экспирацию:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+# ── Inline кнопки ─────────────────────────────────────────────────────────────
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -424,58 +571,36 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s       = get_settings(chat_id)
     data    = q.data
 
-    if data == "scan":              await cmd_scan(update, ctx)
-    elif data == "subscribe":       await cmd_subscribe(update, ctx)
-    elif data == "unsubscribe":     await cmd_unsubscribe(update, ctx)
-    elif data == "settings_menu":   await cmd_settings(update, ctx)
-    elif data == "help":            await cmd_help(update, ctx)
+    if data == "subscribe":      await cmd_subscribe(update, ctx)
+    elif data == "unsubscribe":  await cmd_unsubscribe(update, ctx)
+    elif data == "settings_menu":await cmd_settings(update, ctx)
+    elif data == "help":         await cmd_help(update, ctx)
 
-    elif data == "show_requests":
-        await q.message.reply_text(
-            f"💾 *Запросы Twelve Data*\n\n"
-            f"Использовано сегодня: *{800 - requests_left()}*\n"
-            f"Осталось: *{requests_left()}/800*\n"
-            f"Сброс: каждый день в 00:00",
-            parse_mode="Markdown"
-        )
-
-    # ── Разовая проверка (не меняет настройки) ──
-    elif data == "quick_scan_menu":
-        kb = [[InlineKeyboardButton(f"{v} мин", callback_data=f"quick_{v}") for v in [5,10,15,30]]]
-        kb.append([InlineKeyboardButton(f"{v} мин", callback_data=f"quick_{v}") for v in [45,60]])
-        await q.message.reply_text(
-            "📡 *Разовая проверка*\nВыбери экспирацию (основные настройки не изменятся):",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
-
+    # Разовая проверка
     elif data.startswith("quick_"):
         expiry = int(data.split("_")[1])
-        temp   = s.copy()
+        temp   = s.copy(); temp["expiry"] = expiry
         temp["active_pairs"] = s["active_pairs"].copy()
-        temp["expiry"] = expiry
-        msg = q.message
-        await msg.reply_text(
-            f"🔍 Разовая проверка с экспирацией *{expiry} мин* (TF: {get_interval(expiry)})\n"
-            f"💾 Запросов осталось: {requests_left()}",
+        await q.message.reply_text(
+            f"🔍 Разовая проверка | экспирация *{expiry} мин* | TF: *{get_interval(expiry)}*\n"
+            f"💾 Запросов: {requests_left()}",
             parse_mode="Markdown"
         )
-        await do_scan(msg, temp)
+        await do_scan(q.message, temp, chat_id=chat_id)
 
-    # ── Экспирация ──
+    # Экспирация
     elif data == "set_expiry":
-        kb = [[InlineKeyboardButton(f"{v} мин → TF {get_interval(v)}", callback_data=f"expiry_{v}")]
+        kb = [[InlineKeyboardButton(f"{v} мин → {get_interval(v)}", callback_data=f"expiry_{v}")]
               for v in [5, 10, 15, 30, 60]]
         await q.message.reply_text("⏱ Выбери экспирацию:", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith("expiry_"):
         s["expiry"] = int(data.split("_")[1])
         await q.message.reply_text(
-            f"✅ Экспирация: *{s['expiry']} мин* → TF: *{get_interval(s['expiry'])}*\n"
-            f"Перезапусти подписку: /subscribe",
+            f"✅ Экспирация: *{s['expiry']} мин* → TF: *{get_interval(s['expiry'])}*\nПерезапусти: /subscribe",
             parse_mode="Markdown")
 
-    # ── Период ──
+    # Период
     elif data == "set_period":
         kb = [[InlineKeyboardButton(f"{v} мин", callback_data=f"period_{v}") for v in [5,10,15,30]]]
         await q.message.reply_text("🔄 Как часто сканировать?", reply_markup=InlineKeyboardMarkup(kb))
@@ -486,7 +611,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ Каждые *{s['scan_every']} мин*\nПерезапусти: /subscribe",
             parse_mode="Markdown")
 
-    # ── Торговые часы ──
+    # Торговые часы
     elif data == "set_hours":
         kb = [
             [InlineKeyboardButton("11:00–23:00", callback_data="hours_11_23"),
@@ -503,7 +628,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ *{s['hour_from']}:00–{s['hour_to']}:00 МСК*\nПерезапусти: /subscribe",
             parse_mode="Markdown")
 
-    # ── Скор ──
+    # Скор
     elif data == "set_score":
         kb = [[InlineKeyboardButton(f"{v}%", callback_data=f"score_{v}") for v in [70,75,80,85]]]
         await q.message.reply_text(
@@ -514,16 +639,14 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["min_score"] = int(data.split("_")[1])
         await q.message.reply_text(f"✅ Мин. скор: *{s['min_score']}%*", parse_mode="Markdown")
 
-    # ── Выбор пар ──
+    # Выбор пар
     elif data == "set_pairs":
         kb = []
         for pair in ALL_PAIRS:
             icon = "✅" if pair in s["active_pairs"] else "⬜"
             kb.append([InlineKeyboardButton(f"{icon} {pair}", callback_data=f"toggle_{pair}")])
-        kb.append([InlineKeyboardButton("💾 Готово", callback_data="pairs_done")])
-        await q.message.reply_text(
-            f"📊 Пары (активно: {len(s['active_pairs'])}):",
-            reply_markup=InlineKeyboardMarkup(kb))
+        kb.append([InlineKeyboardButton(f"💾 Готово ({len(s['active_pairs'])} пар)", callback_data="pairs_done")])
+        await q.message.reply_text("📊 Выбери пары:", reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith("toggle_"):
         pair = data[7:]
@@ -533,7 +656,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for p in ALL_PAIRS:
             icon = "✅" if p in s["active_pairs"] else "⬜"
             kb.append([InlineKeyboardButton(f"{icon} {p}", callback_data=f"toggle_{p}")])
-        kb.append([InlineKeyboardButton("💾 Готово", callback_data="pairs_done")])
+        kb.append([InlineKeyboardButton(f"💾 Готово ({len(s['active_pairs'])} пар)", callback_data="pairs_done")])
         await q.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(kb))
 
     elif data == "pairs_done":
@@ -545,13 +668,14 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("scan",        cmd_scan))
+    app.add_handler(CommandHandler("status",      cmd_status))
     app.add_handler(CommandHandler("subscribe",   cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     app.add_handler(CommandHandler("settings",    cmd_settings))
     app.add_handler(CommandHandler("help",        cmd_help))
     app.add_handler(CallbackQueryHandler(button_handler))
-    log.info("🤖 Бот v2 запущен.")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler))
+    log.info("🤖 Бот v3 запущен.")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
