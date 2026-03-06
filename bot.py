@@ -17,6 +17,9 @@ from telegram.ext import (
 BOT_TOKEN       = "8612612451:AAE7dMyGwf1Ddigz23Ygeop5ubh1nkrm6M8"
 TWELVE_DATA_KEY = "55dae6924d864941b1ab27052b0871ef"
 
+# Белый список
+ALLOWED_USERS = {544863362}  # @chief_man_33
+
 DEFAULT_SETTINGS = {
     "expiry":      15,
     "scan_every":  5,
@@ -41,6 +44,9 @@ MSK = ZoneInfo("Europe/Moscow")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 user_settings: dict = {}
+
+def is_allowed(update: Update) -> bool:
+    return update.effective_user.id in ALLOWED_USERS
 
 def get_settings(chat_id: int) -> dict:
     if chat_id not in user_settings:
@@ -220,6 +226,9 @@ async def auto_scan(ctx: ContextTypes.DEFAULT_TYPE):
     log.info(f"Авто-скан {chat_id}: {found} сигналов")
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
     s = get_settings(update.effective_chat.id)
     kb = [
         [InlineKeyboardButton("📡 Сканировать сейчас", callback_data="scan")],
@@ -306,6 +315,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q       = update.callback_query
     await q.answer()
+    if not is_allowed(update):
+        await q.message.reply_text("⛔ Доступ запрещён.")
+        return
     chat_id = update.effective_chat.id
     s       = get_settings(chat_id)
     data    = q.data
